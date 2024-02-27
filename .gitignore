@@ -1,0 +1,9 @@
+**/*.swp
+*~
+!*/
+/.idea/
+build
+vendor/**/*.js
+vendor/**/*.json
+.DS_Store
+object-appender

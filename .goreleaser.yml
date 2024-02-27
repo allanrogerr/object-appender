@@ -1,0 +1,60 @@
+project_name: object-appender
+
+release:
+   name_template: "Release version {{.Version}}"
+
+before:
+  hooks:
+    - go mod tidy -compat=1.21.7
+
+builds:
+  -
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - ppc64le
+      - s390x
+    ignore:
+      - goos: windows
+        goarch: arm64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - --tags=kqueue
+    ldflags:
+      - "-s -w -X main.version={{.Version}}"
+
+archives:
+  -
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    format: binary
+
+nfpms:
+  -
+    vendor: MinIO, Inc.
+    homepage: https://github.com/miniohq/
+    maintainer: MinIO Development <dev@min.io>
+    description: HTTP events to file logger
+    formats:
+      - deb
+      - rpm
+
+signs:
+  -
+    signature: "${artifact}.minisig"
+    cmd: "sh"
+    args:
+      - '-c'
+      - 'minisign -s /media/${USER}/minio/minisign.key -Sm ${artifact} < /media/${USER}/minio/minisign-passphrase'
+    artifacts: all
+
+snapshot:
+  name_template: v0.0.0@{{.ShortCommit}}
+
+changelog:
+  sort: asc
