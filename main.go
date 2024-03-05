@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -25,11 +26,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"io"
 	"log"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -40,18 +37,18 @@ var (
 	endpoint, accessKey, secretKey                 string
 	enableCleanUp                                  string
 
-	targetObject                       string
-	downloadDirectory, uploadDirectory string
+	buffer           *bytes.Buffer
+	targetObjectName string
 
 	// Debug
-	objectCount, objectSize, fileCount, fileSize int64
+	objectCount, objectSize int64
 )
 
 const (
 	// ContentType is defaulted to application/octet-stream for this demo
 	ContentType = "application/octet-stream"
-	// StagingDirectory is the directory when the append operation is performed
-	StagingDirectory = "/tmp"
+	// TimeFormat is the human-readable format used for file naming
+	TimeFormat = "20060102150405"
 )
 
 func main() {
@@ -87,34 +84,22 @@ func main() {
 	}
 
 	ctx := context.Background()
-	now := time.Now().Unix()
-	downloadDirectory = strings.Join([]string{StagingDirectory, sourceBucket, strconv.Itoa(int(now))}, "/")
-	uploadDirectory = strings.Join([]string{StagingDirectory, targetBucket, strconv.Itoa(int(now))}, "/")
-	targetObject = strings.Join([]string{sourceBucket, strconv.Itoa(int(now))}, "-")
-	log.Printf("Staging Directory: %v", downloadDirectory)
+	now := time.Now().UTC()
+	targetObjectName = targetPrefix + "/" + sourceBucket + "-" + now.Format(TimeFormat)
 
-	// Download objects to staging directory
+	buffer = new(bytes.Buffer)
+
+	// Download objects to memory
 	err = downloadObjects(ctx, s3Client)
 	if err != nil {
-		cleanUp()
-		return
-	}
-
-	// Append all source objects into a single resulting target object
-	err = appendObjects()
-	if err != nil {
-		cleanUp()
 		return
 	}
 
 	// Upload single resulting object
 	err = uploadObject(ctx, s3Client)
 	if err != nil {
-		cleanUp()
 		return
 	}
-
-	cleanUp()
 }
 
 // Create a minio client
@@ -130,11 +115,6 @@ func createClient(configEndpoint string) (*minio.Client, error) {
 }
 
 func downloadObjects(ctx context.Context, s3Client *minio.Client) error {
-	if err := os.MkdirAll(filepath.Dir(downloadDirectory), 0777); err != nil {
-		log.Printf("Failed to make directory: %v - %v\n", downloadDirectory, err)
-		return err
-	}
-
 	opts := minio.ListObjectsOptions{
 		Recursive: true,
 		Prefix:    sourcePrefix,
@@ -147,13 +127,16 @@ func downloadObjects(ctx context.Context, s3Client *minio.Client) error {
 			return object.Err
 		} else {
 			objectCount++
-			objectName := strings.Join([]string{downloadDirectory, object.Key}, "/")
-			log.Printf("Downloading: %v to %v", object.Key, objectName)
-			if err := s3Client.FGetObject(context.Background(), sourceBucket /*bucketName*/, object.Key /*objectName*/, objectName /*objectName*/, minio.GetObjectOptions{}); err != nil {
-				log.Printf("Failed to download file: %v - %v\n", objectName, err)
+			log.Printf("Obtaining: %v", object.Key)
+			obj, err := s3Client.GetObject(context.Background(), sourceBucket /*bucketName*/, object.Key /*objectName*/, minio.GetObjectOptions{})
+			if err != nil {
+				log.Printf("Failed to obtain object: %v - %v\n", object.Key, err)
 				return err
 			}
 			objectSize += object.Size
+			if _, err := io.Copy(buffer, obj); err != nil {
+				log.Fatalln(err)
+			}
 		}
 	}
 	if objectCount == 0 {
@@ -162,98 +145,6 @@ func downloadObjects(ctx context.Context, s3Client *minio.Client) error {
 	}
 	log.Printf("Found objects: %v, size: %v", objectCount, objectSize)
 
-	return nil
-}
-
-func appendObjects() error {
-	// Allows for mutual exclusion
-	var mu sync.Mutex
-	// Remove file if exists
-	objectName := strings.Join([]string{uploadDirectory, targetObject}, "/")
-	err := os.Remove(objectName)
-	if err != nil {
-		// Could not remove file
-		log.Printf("Failed to remove file: %v - %v\n", objectName, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(objectName), 0777); err != nil {
-		log.Printf("Failed to make directory: %v - %v\n", objectName, err)
-		return err
-	}
-	out, err := os.OpenFile(objectName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
-	if err != nil {
-		log.Printf("Failed to open file: %v - %v\n", objectName, err)
-		return err
-	}
-	defer out.Close()
-	// Locking objects to prevent other processes from modifying them
-	mu.Lock()
-	// Walk the file path to append all files
-	err = filepath.Walk(downloadDirectory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			mu.Unlock()
-			log.Printf("Failed to walk: %v\n", err)
-			return err
-		}
-		if !info.IsDir() {
-			fileCount++
-			log.Printf("Adding: %s\n", info.Name())
-			in, err := os.Open(path)
-			if err != nil {
-				mu.Unlock()
-				log.Printf("Failed to open: %v - %v\n", path, err)
-				return err
-			}
-			_, err = io.Copy(out, in)
-			if err != nil {
-				mu.Unlock()
-				log.Printf("Failed to append: %v - %v\n", path, err)
-				return err
-			}
-			info, err := in.Stat()
-			if err != nil {
-				mu.Unlock()
-				log.Printf("Failed to stat: %v - %v\n", path, err)
-				return err
-			}
-			fileSize += info.Size()
-		}
-		return nil
-	})
-	log.Printf("Processed files: %v, size: %v", fileCount, fileSize)
-	info, err := out.Stat()
-	if err != nil {
-		mu.Unlock()
-		log.Printf("Failed to stat: %v - %v\n", out.Name(), err)
-		return err
-	}
-	log.Printf("Created resulting file: %v, size: %v", out.Name(), info.Size())
-
-	if err != nil {
-		log.Printf("Could not walk: %v - %v\n", downloadDirectory, err)
-		return err
-	}
-	// Test sum of objects versus files
-	if objectCount != fileCount {
-		mu.Unlock()
-		log.Printf("Found total files number: %v - expected %v\n", fileCount, objectCount)
-		return err
-	}
-
-	// Test cumulative object sizes versus file sizes
-	if objectSize != fileSize {
-		mu.Unlock()
-		log.Printf("Found total files size: %v - expected: %v\n", fileSize, objectSize)
-		return err
-	}
-
-	// Test resulting file size
-	if objectSize != info.Size() {
-		mu.Unlock()
-		log.Printf("Found resulting object size: %v - expected: %v\n", info.Size(), objectSize)
-		return err
-	}
-
-	mu.Unlock()
 	return nil
 }
 
@@ -276,27 +167,13 @@ func uploadObject(ctx context.Context, s3Client *minio.Client) error {
 	}
 
 	// Upload the object
-	log.Printf("Uploading %s to %s\n", targetObject, targetBucketPrefix)
-	_, err = s3Client.FPutObject(ctx, targetBucket /*bucketName*/, strings.Join([]string{targetPrefix, targetObject}, "/") /*objectName*/, strings.Join([]string{uploadDirectory, targetObject}, "/") /*filePath*/, minio.PutObjectOptions{ContentType: ContentType})
+	log.Printf("Uploading %s to %s\n", targetObjectName, targetBucketPrefix)
+	_, err = s3Client.PutObject(ctx, targetBucket /*bucketName*/, targetObjectName /*objectName*/, buffer /*reader*/, objectSize /*objectSize*/, minio.PutObjectOptions{ContentType: ContentType})
 	if err != nil {
-		log.Printf("Failed to upload object %v - %v\n", strings.Join([]string{targetPrefix, targetObject}, "/"), err)
+		log.Printf("Failed to upload object %v - %v\n", targetObjectName, err)
 		return err
 	}
 
-	log.Printf("Successfully uploaded %s to %s\n", targetObject, targetBucketPrefix)
+	log.Printf("Successfully uploaded %s to %s\n", targetObjectName, targetBucketPrefix)
 	return nil
-}
-
-func cleanUp() {
-	if enableCleanUp != "true" {
-		if err := os.RemoveAll(filepath.Dir(downloadDirectory)); err != nil {
-			log.Fatalf("Failed to cleanup directory: %v - %v\n", downloadDirectory, err)
-		}
-		if err := os.RemoveAll(filepath.Dir(uploadDirectory)); err != nil {
-			log.Fatalf("Failed to cleanup directory: %v - %v\n", downloadDirectory, err)
-		}
-		log.Println("Staging directories cleaned up")
-		return
-	}
-	log.Println("Clean up is disabled")
 }
