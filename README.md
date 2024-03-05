@@ -1,9 +1,10 @@
 # Object Appender
 
-`object-appender` downloads and appends objects under an s3 bucket/prefix, then uploads the single resulting object to another s3 bucket/prefix
+`object-appender` gets and appends objects in memory, under an s3 bucket/prefix, then uploads the single resulting object to another s3 bucket/prefix
 
 Usage:
 ```
+go build
 ./object-appender --source-bucket-prefix <source-bucket-prefix> \
 --target-bucket-prefix <target-bucket-prefix> \
 --endpoint <endpoint> \
